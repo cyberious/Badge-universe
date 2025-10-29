@@ -21,13 +21,16 @@ faded = brushes.color(235, 245, 255, 100)
 small_font = PixelFont.load("/system/assets/fonts/ark.ppf")
 large_font = PixelFont.load("/system/assets/fonts/absolute.ppf")
 
-WIFI_TIMEOUT = 60
+WIFI_TIMEOUT = 120
 CONTRIB_URL = "https://github.com/{user}.contribs"
 USER_AVATAR = "https://wsrv.nl/?url=https://github.com/{user}.png&w=75&output=png"
 DETAILS_URL = "https://api.github.com/users/{user}"
 
 WIFI_PASSWORD = None
 WIFI_SSID = None
+WIFI_NETWORKS = []
+current_network_index = 0
+network_attempt_start = None
 
 wlan = None
 connected = False
@@ -39,21 +42,29 @@ def message(text):
 
 
 def get_connection_details(user):
-    global WIFI_PASSWORD, WIFI_SSID
+    global WIFI_PASSWORD, WIFI_SSID, WIFI_NETWORKS
 
     if WIFI_SSID is not None and user.handle is not None:
         return True
 
     try:
         sys.path.insert(0, "/")
-        from secrets import WIFI_PASSWORD, WIFI_SSID, GITHUB_USERNAME
+        from secrets import WIFI_PASSWORD, WIFI_SSID, GITHUB_USERNAME, WIFI_NETWORKS
         sys.path.pop(0)
     except ImportError:
-        WIFI_PASSWORD = None
-        WIFI_SSID = None
-        GITHUB_USERNAME = None
+        try:
+            # Try importing just the old format
+            sys.path.insert(0, "/")
+            from secrets import WIFI_PASSWORD, WIFI_SSID, GITHUB_USERNAME
+            sys.path.pop(0)
+            WIFI_NETWORKS = []
+        except ImportError:
+            WIFI_PASSWORD = None
+            WIFI_SSID = None
+            GITHUB_USERNAME = None
+            WIFI_NETWORKS = []
 
-    if not WIFI_SSID:
+    if not WIFI_SSID and not WIFI_NETWORKS:
         return False
 
     if not GITHUB_USERNAME:
@@ -65,10 +76,13 @@ def get_connection_details(user):
 
 
 def wlan_start():
-    global wlan, ticks_start, connected, WIFI_PASSWORD, WIFI_SSID
+    global wlan, ticks_start, connected, WIFI_PASSWORD, WIFI_SSID, WIFI_NETWORKS
+    global current_network_index, network_attempt_start
 
     if ticks_start is None:
         ticks_start = io.ticks
+        current_network_index = 0
+        network_attempt_start = io.ticks
 
     if connected:
         return True
@@ -78,10 +92,44 @@ def wlan_start():
         wlan.active(True)
 
         if wlan.isconnected():
+            connected = True
             return True
 
-    # attempt to find the SSID by scanning; some APs may be hidden intermittently
+    # Determine which networks to try - prioritize WIFI_NETWORKS if available
+    networks_to_try = []
+    if WIFI_NETWORKS:
+        networks_to_try = WIFI_NETWORKS
+    elif WIFI_SSID and WIFI_PASSWORD:
+        networks_to_try = [{"ssid": WIFI_SSID, "password": WIFI_PASSWORD}]
+    
+    if not networks_to_try:
+        print("No WiFi networks configured")
+        return False
+
+    # Check if we've exhausted all networks
+    if current_network_index >= len(networks_to_try):
+        print("All WiFi networks failed - giving up")
+        return False
+
+    # Get current network to try
+    current_network = networks_to_try[current_network_index]
+    current_ssid = current_network["ssid"]
+    current_password = current_network["password"]
+
     try:
+        # Check if we should move to the next network (timeout reached)
+        network_timeout = WIFI_TIMEOUT * 1000 // len(networks_to_try)  # Divide timeout among networks
+        if io.ticks - network_attempt_start > network_timeout:
+            print(f"Timeout reached for network '{current_ssid}', trying next network...")
+            current_network_index += 1
+            network_attempt_start = io.ticks
+            if current_network_index >= len(networks_to_try):
+                return False
+            current_network = networks_to_try[current_network_index]
+            current_ssid = current_network["ssid"]
+            current_password = current_network["password"]
+
+        # Scan for available networks
         ssid_found = False
         try:
             scans = wlan.scan()
@@ -96,49 +144,61 @@ def wlan_start():
                     ss = ss.decode("utf-8", "ignore")
                 except Exception:
                     ss = str(ss)
-            if ss == WIFI_SSID:
+            if ss == current_ssid:
                 ssid_found = True
                 break
 
         if not ssid_found:
-            # not found yet; if still within timeout, keep trying on subsequent calls
-            if io.ticks - ticks_start < WIFI_TIMEOUT * 1000:
-                # optionally print once every few seconds to avoid spamming
-                if (io.ticks - ticks_start) % 3000 < 50:
-                    print("SSID not visible yet; rescanning...")
-                # return True to indicate we're still attempting to connect (in-progress)
+            # SSID not found yet; if still within network timeout, keep trying
+            if io.ticks - network_attempt_start < network_timeout:
+                # Print status occasionally to avoid spamming
+                if (io.ticks - network_attempt_start) % 3000 < 50:
+                    print(f"Searching for network '{current_ssid}' ({current_network_index + 1}/{len(networks_to_try)})...")
                 return True
             else:
-                # timed out
-                return False
-
-        # SSID is visible; attempt to connect (or re-attempt)
-        try:
-            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-        except Exception:
-            # connection initiation failed; we'll retry while still within timeout
-            if io.ticks - ticks_start < WIFI_TIMEOUT * 1000:
+                # Move to next network
+                print(f"Network '{current_ssid}' not found, trying next...")
+                current_network_index += 1
+                network_attempt_start = io.ticks
                 return True
-            return False
 
-        print("Connecting to WiFi...")
-
-        # update connected state
-        connected = wlan.isconnected()
-
-        # if connected, return True; otherwise indicate in-progress until timeout
-        if connected:
-            return True
-        if io.ticks - ticks_start < WIFI_TIMEOUT * 1000:
-            return True
-        return False
-    except Exception as e:
-        # on unexpected errors, don't crash the UI; report and return False
+        # SSID is visible; attempt to connect
         try:
-            print("wlan_start error:", e)
+            print(f"Connecting to '{current_ssid}'...")
+            wlan.connect(current_ssid, current_password)
+        except Exception as e:
+            print(f"Connection failed for '{current_ssid}': {e}")
+            # Move to next network on connection failure
+            current_network_index += 1
+            network_attempt_start = io.ticks
+            return True
+
+        # Check connection status
+        connected = wlan.isconnected()
+        
+        if connected:
+            print(f"Successfully connected to '{current_ssid}'!")
+            return True
+        
+        # Still connecting, wait a bit more
+        if io.ticks - network_attempt_start < network_timeout:
+            return True
+        
+        # Timeout reached, try next network
+        print(f"Connection timeout for '{current_ssid}', trying next...")
+        current_network_index += 1
+        network_attempt_start = io.ticks
+        return True
+
+    except Exception as e:
+        # on unexpected errors, don't crash the UI; report and try next network
+        try:
+            print(f"wlan_start error with '{current_ssid}': {e}")
+            current_network_index += 1
+            network_attempt_start = io.ticks
         except Exception:
             pass
-        return False
+        return True if current_network_index < len(networks_to_try) else False
 
 
 def async_fetch_to_disk(url, file, force_update=False):
